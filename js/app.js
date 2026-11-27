@@ -32,6 +32,15 @@
   const rangeForm = document.getElementById('rangeForm');
   const rangeInput = document.getElementById('rangeInput');
 
+  const whitenSlider = document.getElementById('whitenSlider');
+  const whitenValue = document.getElementById('whitenValue');
+  const autoWhitenBtn = document.getElementById('autoWhitenBtn');
+  const resetWhitenBtn = document.getElementById('resetWhitenBtn');
+  const enhanceSwatch = document.getElementById('enhanceSwatch');
+  const enhanceSwatchDot = document.getElementById('enhanceSwatchDot');
+  const enhanceSwatchText = document.getElementById('enhanceSwatchText');
+  const pdfWhitenMatrix = document.getElementById('pdfWhitenMatrix');
+
   const thumbnailGrid = document.getElementById('thumbnailGrid');
   const toastEl = document.getElementById('toast');
 
@@ -44,6 +53,8 @@
     totalPages: 0,
     selected: new Set(),  // 0-based 选中页码集合
     lastClickedIndex: null,
+    whiten: 0,            // 手动去灰底强度 (0 ~ 0.45)
+    whitenColor: null,    // 自动识别的背景色 { r, g, b } (0 ~ 0.55)
     isExporting: false,
     observer: null,
     renderQueue: [],
@@ -103,6 +114,7 @@
 
     thumbnailGrid.innerHTML = '';
     rangeInput.value = '';
+    resetEnhancement(false);
   }
 
   // ===== 打开并解析 PDF =====
@@ -324,6 +336,199 @@
     updateSelectionUI();
   }
 
+  // ===== 增强模块：去灰底（矢量背景漂白） =====
+  function rgbToHex(r, g, b) {
+    const toHex = (v) =>
+      Math.max(0, Math.min(255, Math.round(v * 255)))
+        .toString(16)
+        .padStart(2, '0');
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+  }
+
+  function getActiveWhitenRgb() {
+    if (state.whitenColor) {
+      return state.whitenColor;
+    }
+    if (state.whiten > 0) {
+      return { r: state.whiten, g: state.whiten, b: state.whiten };
+    }
+    return null;
+  }
+
+  function updateEnhancementUI() {
+    const rgb = getActiveWhitenRgb();
+
+    if (!rgb) {
+      thumbnailGrid.style.setProperty('--thumb-invert-filter', 'invert(1)');
+      whitenSlider.value = '0';
+      whitenValue.textContent = '0%';
+      enhanceSwatch.hidden = true;
+      resetWhitenBtn.hidden = true;
+      return;
+    }
+
+    // 与 PDF /ColorDodge(r, g, b) 数学完全等价：output = min(1, Cb / (1 - c))
+    const kr = (1 / Math.max(0.25, 1 - rgb.r)).toFixed(4);
+    const kg = (1 / Math.max(0.25, 1 - rgb.g)).toFixed(4);
+    const kb = (1 / Math.max(0.25, 1 - rgb.b)).toFixed(4);
+
+    if (pdfWhitenMatrix) {
+      pdfWhitenMatrix.setAttribute(
+        'values',
+        `${kr} 0 0 0 0  0 ${kg} 0 0 0  0 0 ${kb} 0 0  0 0 0 1 0`
+      );
+      thumbnailGrid.style.setProperty(
+        '--thumb-invert-filter',
+        'invert(1) url(#pdfWhitenFilter)'
+      );
+    } else {
+      const k = Math.max(Number(kr), Number(kg), Number(kb)).toFixed(4);
+      thumbnailGrid.style.setProperty(
+        '--thumb-invert-filter',
+        `invert(1) brightness(${k})`
+      );
+    }
+
+    const pct = Math.round(Math.max(rgb.r, rgb.g, rgb.b) * 100);
+    whitenSlider.value = String(Math.min(45, pct));
+    whitenValue.textContent = `${pct}%`;
+    resetWhitenBtn.hidden = false;
+
+    if (state.whitenColor) {
+      const hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+      enhanceSwatchDot.style.backgroundColor = hex;
+      enhanceSwatchText.textContent = `底色 ${hex}`;
+      enhanceSwatch.hidden = false;
+    } else {
+      enhanceSwatch.hidden = true;
+    }
+  }
+
+  function resetEnhancement(notify = true) {
+    state.whiten = 0;
+    state.whitenColor = null;
+    updateEnhancementUI();
+    if (notify) {
+      showToast('已重置去灰底参数', 'info', 1600);
+    }
+  }
+
+  /**
+   * 采样一页的像素，自动识别黑板/深灰背景的主色
+   */
+  async function sampleCanvasForPage(pageIndex) {
+    const card = thumbnailGrid.children[pageIndex];
+    if (card) {
+      const frame = card.querySelector('.thumb-frame');
+      const canvas = card.querySelector('.thumb-canvas');
+      if (frame && !frame.classList.contains('is-loading') && canvas.width > 0) {
+        return canvas;
+      }
+    }
+
+    if (!state.pdfJsDoc) return null;
+    const page = await state.pdfJsDoc.getPage(pageIndex + 1);
+    const baseVp = page.getViewport({ scale: 1 });
+    const scale = Math.min(240 / baseVp.width, 1);
+    const vp = page.getViewport({ scale });
+    const offscreen = document.createElement('canvas');
+    offscreen.width = Math.ceil(vp.width);
+    offscreen.height = Math.ceil(vp.height);
+    const ctx = offscreen.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, offscreen.width, offscreen.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    return offscreen;
+  }
+
+  async function handleAutoWhiten() {
+    if (!state.pdfJsDoc) return;
+
+    const targetIndex =
+      state.selected.size > 0 ? Math.min(...state.selected) : 0;
+
+    autoWhitenBtn.disabled = true;
+    try {
+      const canvas = await sampleCanvasForPage(targetIndex);
+      if (!canvas) return;
+
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const { width, height } = canvas;
+      const data = ctx.getImageData(0, 0, width, height).data;
+
+      // 步进采样像素，按 4 级量化统计深色区域（RGB <= 170）的主众数
+      const step = Math.max(1, Math.floor(Math.sqrt((width * height) / 8000)));
+      const buckets = new Map();
+      let totalSampled = 0;
+
+      for (let y = 2; y < height - 2; y += step) {
+        for (let x = 2; x < width - 2; x += step) {
+          totalSampled++;
+          const idx = (y * width + x) * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+
+          if (r <= 170 && g <= 170 && b <= 170) {
+            const kr = (r >> 2) << 2;
+            const kg = (g >> 2) << 2;
+            const kb = (b >> 2) << 2;
+            const key = (kr << 16) | (kg << 8) | kb;
+            let entry = buckets.get(key);
+            if (!entry) {
+              entry = { count: 0, sumR: 0, sumG: 0, sumB: 0 };
+              buckets.set(key, entry);
+            }
+            entry.count++;
+            entry.sumR += r;
+            entry.sumG += g;
+            entry.sumB += b;
+          }
+        }
+      }
+
+      let best = null;
+      for (const entry of buckets.values()) {
+        if (!best || entry.count > best.count) {
+          best = entry;
+        }
+      }
+
+      if (!best || best.count < totalSampled * 0.18) {
+        showToast('未检测到明显深色背景，可手动拖动滑块微调', 'info', 2600);
+        return;
+      }
+
+      const avgR = best.sumR / best.count;
+      const avgG = best.sumG / best.count;
+      const avgB = best.sumB / best.count;
+
+      if (Math.max(avgR, avgG, avgB) <= 6) {
+        resetEnhancement(false);
+        showToast('当前背景已接近纯黑，无需额外去灰底', 'success', 2400);
+        return;
+      }
+
+      // 叠加约 2% 容差，消除压缩噪点导致的边缘残留灰斑
+      const margin = 5 / 255;
+      const r = Math.min(0.55, avgR / 255 + margin);
+      const g = Math.min(0.55, avgG / 255 + margin);
+      const b = Math.min(0.55, avgB / 255 + margin);
+
+      state.whiten = 0;
+      state.whitenColor = { r, g, b };
+      updateEnhancementUI();
+
+      const rawHex = rgbToHex(avgR / 255, avgG / 255, avgB / 255);
+      showToast(`已识别背景色 ${rawHex}，已自动漂白为纯白底`, 'success', 2800);
+    } catch (err) {
+      console.error(err);
+      showToast('自动识别背景失败，请手动拖动滑块调节', 'error');
+    } finally {
+      autoWhitenBtn.disabled = false;
+    }
+  }
+
   // ===== 导出反色 PDF =====
   async function handleExport() {
     if (state.isExporting || !state.pdfBytes) return;
@@ -342,6 +547,10 @@
       const outputBytes = await invertPdfPages(
         state.pdfBytes,
         state.selected,
+        {
+          whiten: state.whiten,
+          whitenColor: state.whitenColor,
+        },
         (done, total) => {
           const pct = Math.max(5, Math.round((done / total) * 90));
           progressFill.style.width = `${pct}%`;
@@ -483,6 +692,16 @@
     updateSelectionUI();
     showToast(`已选中 ${pages.size} 页`, 'info', 1800);
   });
+
+  // 增强模块事件绑定
+  whitenSlider.addEventListener('input', () => {
+    state.whitenColor = null;
+    state.whiten = Number(whitenSlider.value) / 100;
+    updateEnhancementUI();
+  });
+
+  autoWhitenBtn.addEventListener('click', handleAutoWhiten);
+  resetWhitenBtn.addEventListener('click', () => resetEnhancement(true));
 
   exportBtn.addEventListener('click', handleExport);
 })();

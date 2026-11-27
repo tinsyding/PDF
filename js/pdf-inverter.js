@@ -118,17 +118,52 @@
   }
 
   /**
-   * 对指定页码集合执行原地无损反色
+   * 规范化去灰底（ColorDodge）RGB 参数，范围限制在 [0, 0.75] 防止除零
+   */
+  function resolveWhitenRgb(options) {
+    if (!options) return null;
+    const clamp = (v) => Math.max(0, Math.min(0.75, Number(v) || 0));
+
+    if (options.whitenColor) {
+      const r = clamp(options.whitenColor.r);
+      const g = clamp(options.whitenColor.g);
+      const b = clamp(options.whitenColor.b);
+      if (r > 0 || g > 0 || b > 0) {
+        return { r, g, b };
+      }
+      return null;
+    }
+
+    if (typeof options.whiten === 'number' && options.whiten > 0) {
+      const t = clamp(options.whiten);
+      return { r: t, g: t, b: t };
+    }
+
+    return null;
+  }
+
+  /**
+   * 对指定页码集合执行原地无损反色（支持可选的 /ColorDodge 去灰底增强）
    *
    * @param {Uint8Array|ArrayBuffer} pdfBytes 原始 PDF 字节
    * @param {Set<number>|number[]} selectedPages 需要反色的 0-based 页码集合
-   * @param {(done: number, total: number) => void} [onProgress] 进度回调
+   * @param {(done: number, total: number) => void | { whiten?: number, whitenColor?: { r: number, g: number, b: number } }} [optionsOrProgress]
+   * @param {(done: number, total: number) => void} [maybeProgress] 进度回调
    * @returns {Promise<Uint8Array>} 反色后的完整 PDF 字节
    */
-  async function invertPdfPages(pdfBytes, selectedPages, onProgress) {
+  async function invertPdfPages(pdfBytes, selectedPages, optionsOrProgress, maybeProgress) {
     const PDFLib = getPDFLib();
     const { PDFDocument, PDFName } = PDFLib;
 
+    let options = null;
+    let onProgress = maybeProgress;
+    if (typeof optionsOrProgress === 'function') {
+      onProgress = optionsOrProgress;
+    } else if (optionsOrProgress && typeof optionsOrProgress === 'object') {
+      options = optionsOrProgress;
+    }
+
+    const whitenRgb = resolveWhitenRgb(options);
     const selectedSet =
       selectedPages instanceof Set ? selectedPages : new Set(selectedPages);
 
@@ -150,6 +185,16 @@
         BM: 'Difference',
       })
     );
+
+    // 若开启去灰底增强，共享一个 /ColorDodge 混合模式的 ExtGState
+    const gsDodgeRef = whitenRgb
+      ? context.register(
+          context.obj({
+            Type: 'ExtGState',
+            BM: 'ColorDodge',
+          })
+        )
+      : null;
 
     const transparencyGroup = () =>
       context.obj({
@@ -189,29 +234,38 @@
 
       // 2. 为页面设置 RGB 透明组与新的独立资源字典（避免与原资源命名冲突）
       pageNode.set(PDFName.of('Group'), transparencyGroup());
+      const extGStateMap = { GSInv: gsInvRef };
+      if (gsDodgeRef) {
+        extGStateMap.GSDodge = gsDodgeRef;
+      }
       pageNode.set(
         PDFName.of('Resources'),
         context.obj({
           XObject: {
             FmOrig: formRef,
           },
-          ExtGState: {
-            GSInv: gsInvRef,
-          },
+          ExtGState: extGStateMap,
         })
       );
 
-      // 3. 构造三层绘制指令流：纯白底 -> 原页面 Form -> /Difference 纯白遮罩
+      // 3. 构造绘制指令流：纯白底 -> 原页面 Form -> /Difference 纯白遮罩 [-> /ColorDodge 去灰底]
       const rect = `${fmtNum(x)} ${fmtNum(y)} ${fmtNum(width)} ${fmtNum(height)} re`;
       const bgOps = `q\n1 1 1 rg\n${rect}\nf\nQ\n`;
       const fgOps = `q\n/FmOrig Do\nQ\n`;
       const overlayOps = `q\n/GSInv gs\n1 1 1 rg\n${rect}\nf\nQ\n`;
 
-      const bgRef = context.register(context.flateStream(bgOps));
-      const fgRef = context.register(context.flateStream(fgOps));
-      const overlayRef = context.register(context.flateStream(overlayOps));
+      const contentRefs = [
+        context.register(context.flateStream(bgOps)),
+        context.register(context.flateStream(fgOps)),
+        context.register(context.flateStream(overlayOps)),
+      ];
 
-      pageNode.set(PDFName.of('Contents'), context.obj([bgRef, fgRef, overlayRef]));
+      if (whitenRgb) {
+        const dodgeOps = `q\n/GSDodge gs\n${fmtNum(whitenRgb.r)} ${fmtNum(whitenRgb.g)} ${fmtNum(whitenRgb.b)} rg\n${rect}\nf\nQ\n`;
+        contentRefs.push(context.register(context.flateStream(dodgeOps)));
+      }
+
+      pageNode.set(PDFName.of('Contents'), context.obj(contentRefs));
 
       processed++;
       if (typeof onProgress === 'function') {

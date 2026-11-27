@@ -88,6 +88,40 @@
             </form>
           </div>
 
+          <!-- 增强模块：去灰底（矢量背景漂白） -->
+          <div class="toolbar-row toolbar-enhance" aria-label="增强模块">
+            <div class="enhance-label-group">
+              <span class="enhance-tag">增强模块</span>
+              <span class="enhance-title">去灰底（黑板漂白）</span>
+              <span class="enhance-swatch" id="enhanceSwatch" hidden>
+                <span class="swatch-dot" id="enhanceSwatchDot"></span>
+                <span id="enhanceSwatchText"></span>
+              </span>
+            </div>
+
+            <div class="enhance-controls">
+              <label class="slider-wrap" for="whitenSlider">
+                <span class="slider-caption">强度</span>
+                <input
+                  type="range"
+                  id="whitenSlider"
+                  class="enhance-slider"
+                  min="0"
+                  max="45"
+                  step="1"
+                  value="0"
+                >
+                <span class="slider-value" id="whitenValue">0%</span>
+              </label>
+              <button type="button" class="btn btn-subtle" id="autoWhitenBtn" title="自动采样页面背景色并计算最佳去灰底参数">
+                自动识别背景
+              </button>
+              <button type="button" class="btn btn-ghost" id="resetWhitenBtn" hidden>
+                重置
+              </button>
+            </div>
+          </div>
+
           <!-- 进度条 -->
           <div class="progress-track" id="progressTrack" hidden aria-live="polite">
             <div class="progress-fill" id="progressFill"></div>
@@ -102,6 +136,15 @@
     <!-- 提示条 -->
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   </div>
+
+  <!-- 用于与 PDF /ColorDodge 数学等价的实时缩略图预览滤镜 -->
+  <svg width="0" height="0" style="position:absolute;pointer-events:none" aria-hidden="true">
+    <defs>
+      <filter id="pdfWhitenFilter" color-interpolation-filters="sRGB">
+        <feColorMatrix id="pdfWhitenMatrix" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"></feColorMatrix>
+      </filter>
+    </defs>
+  </svg>
 
   <!-- 本地依赖库（零外部 CDN，完全离线可用） -->
   <script src="vendor/pdf.min.js"></script>
