@@ -24,6 +24,7 @@
   const progressTrack = document.getElementById('progressTrack');
   const progressFill = document.getElementById('progressFill');
 
+  const smartSelectBtn = document.getElementById('smartSelectBtn');
   const selectAllBtn = document.getElementById('selectAllBtn');
   const selectNoneBtn = document.getElementById('selectNoneBtn');
   const invertSelectionBtn = document.getElementById('invertSelectionBtn');
@@ -55,6 +56,11 @@
     lastClickedIndex: null,
     whiten: 0,            // 手动去灰底强度 (0 ~ 0.45)
     whitenColor: null,    // 自动识别的背景色 { r, g, b } (0 ~ 0.55)
+    detectedDarkPages: null, // 自动扫描缓存的暗底页码数组
+    detectedBgColor: null,   // 自动扫描缓存的背景色 { r, g, b }（原色 0~255）
+    userTouchedSelection: false,
+    userTouchedWhiten: false,
+    isAnalyzing: false,
     isExporting: false,
     observer: null,
     renderQueue: [],
@@ -97,6 +103,11 @@
     state.renderedPages.clear();
     state.selected.clear();
     state.lastClickedIndex = null;
+    state.detectedDarkPages = null;
+    state.detectedBgColor = null;
+    state.userTouchedSelection = false;
+    state.userTouchedWhiten = false;
+    state.isAnalyzing = false;
 
     if (state.observer) {
       state.observer.disconnect();
@@ -162,7 +173,7 @@
       state.pdfJsDoc = pdfJsDoc;
       state.totalPages = pdfJsDoc.numPages;
 
-      // 默认全选所有页面
+      // 初始全选，随后后台自动识别暗底页并更新选中与去灰底强度
       for (let i = 0; i < state.totalPages; i++) {
         state.selected.add(i);
       }
@@ -176,6 +187,9 @@
 
       buildThumbnailCards();
       updateSelectionUI();
+
+      // 自动识别暗底页面与去灰底强度
+      autoAnalyzeDocument(currentSession, { force: false });
     } catch (err) {
       console.error(err);
       showToast('无法解析该 PDF 文件，请确认文件未损坏或未加密', 'error', 3600);
@@ -414,9 +428,9 @@
   }
 
   /**
-   * 采样一页的像素，自动识别黑板/深灰背景的主色
+   * 采样一页的像素画布（优先复用已渲染缩略图，否则按指定宽度快速离屏渲染）
    */
-  async function sampleCanvasForPage(pageIndex) {
+  async function sampleCanvasForPage(pageIndex, maxWidth = 240) {
     const card = thumbnailGrid.children[pageIndex];
     if (card) {
       const frame = card.querySelector('.thumb-frame');
@@ -429,16 +443,237 @@
     if (!state.pdfJsDoc) return null;
     const page = await state.pdfJsDoc.getPage(pageIndex + 1);
     const baseVp = page.getViewport({ scale: 1 });
-    const scale = Math.min(240 / baseVp.width, 1);
+    const scale = Math.min(maxWidth / baseVp.width, 1);
     const vp = page.getViewport({ scale });
     const offscreen = document.createElement('canvas');
-    offscreen.width = Math.ceil(vp.width);
-    offscreen.height = Math.ceil(vp.height);
+    offscreen.width = Math.max(1, Math.ceil(vp.width));
+    offscreen.height = Math.max(1, Math.ceil(vp.height));
     const ctx = offscreen.getContext('2d', { alpha: false });
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, offscreen.width, offscreen.height);
     await page.render({ canvasContext: ctx, viewport: vp }).promise;
     return offscreen;
+  }
+
+  /**
+   * 分析画布像素：判断是否为暗底页，并提取暗色主背景 RGB（0~255）
+   */
+  function analyzeCanvasBackground(canvas) {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const { width, height } = canvas;
+    const data = ctx.getImageData(0, 0, width, height).data;
+
+    const step = Math.max(1, Math.floor(Math.sqrt((width * height) / 4000)));
+    const buckets = new Map();
+    let totalSampled = 0;
+    let darkPixels = 0;
+
+    const padX = width > 8 ? 2 : 0;
+    const padY = height > 8 ? 2 : 0;
+
+    for (let y = padY; y < height - padY; y += step) {
+      for (let x = padX; x < width - padX; x += step) {
+        totalSampled++;
+        const idx = (y * width + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum < 115) {
+          darkPixels++;
+        }
+
+        if (r <= 170 && g <= 170 && b <= 170) {
+          const kr = (r >> 2) << 2;
+          const kg = (g >> 2) << 2;
+          const kb = (b >> 2) << 2;
+          const key = (kr << 16) | (kg << 8) | kb;
+          let entry = buckets.get(key);
+          if (!entry) {
+            entry = { count: 0, sumR: 0, sumG: 0, sumB: 0 };
+            buckets.set(key, entry);
+          }
+          entry.count++;
+          entry.sumR += r;
+          entry.sumG += g;
+          entry.sumB += b;
+        }
+      }
+    }
+
+    if (totalSampled === 0) {
+      return { isDark: false, dominantRgb: null, dominantDarkRatio: 0, darkRatio: 0 };
+    }
+
+    let best = null;
+    for (const entry of buckets.values()) {
+      if (!best || entry.count > best.count) {
+        best = entry;
+      }
+    }
+
+    const darkRatio = darkPixels / totalSampled;
+    const dominantDarkRatio = best ? best.count / totalSampled : 0;
+    const isDark = darkRatio >= 0.45 || dominantDarkRatio >= 0.35;
+
+    const dominantRgb =
+      best && dominantDarkRatio >= 0.18
+        ? {
+            r: best.sumR / best.count,
+            g: best.sumG / best.count,
+            b: best.sumB / best.count,
+          }
+        : null;
+
+    return { isDark, dominantRgb, dominantDarkRatio, darkRatio };
+  }
+
+  /**
+   * 根据检测到的原始暗背景色（0~255）应用去灰底参数
+   * 返回是否应用了非零漂白
+   */
+  function applyDetectedBgColor(avgRgb) {
+    if (!avgRgb || Math.max(avgRgb.r, avgRgb.g, avgRgb.b) <= 6) {
+      state.whiten = 0;
+      state.whitenColor = null;
+      updateEnhancementUI();
+      return false;
+    }
+
+    // 叠加约 2% 容差，消除压缩噪点导致的边缘残留灰斑
+    const margin = 5 / 255;
+    state.whiten = 0;
+    state.whitenColor = {
+      r: Math.min(0.55, avgRgb.r / 255 + margin),
+      g: Math.min(0.55, avgRgb.g / 255 + margin),
+      b: Math.min(0.55, avgRgb.b / 255 + margin),
+    };
+    updateEnhancementUI();
+    return true;
+  }
+
+  /**
+   * 后台快速扫描整份 PDF：自动选中暗底页面 + 自动识别去灰底强度
+   */
+  async function autoAnalyzeDocument(sessionId, { force = false } = {}) {
+    if (!state.pdfJsDoc || sessionId !== state.sessionId) return;
+
+    // 已有缓存结果且手动触发“智能选页”时直接复用
+    if (force && state.detectedDarkPages !== null) {
+      applySmartAnalysisResult({ force: true });
+      return;
+    }
+
+    if (state.isAnalyzing) return;
+    state.isAnalyzing = true;
+    smartSelectBtn.disabled = true;
+
+    const total = state.totalPages;
+    const darkPages = [];
+    const bgSamples = [];
+    let scanned = 0;
+
+    const BATCH_SIZE = 4;
+    try {
+      for (let start = 0; start < total; start += BATCH_SIZE) {
+        if (sessionId !== state.sessionId) return;
+
+        const batch = [];
+        for (let i = start; i < Math.min(total, start + BATCH_SIZE); i++) {
+          batch.push(
+            sampleCanvasForPage(i, 80)
+              .then((canvas) => {
+                if (!canvas || sessionId !== state.sessionId) return;
+                const info = analyzeCanvasBackground(canvas);
+                if (info.isDark) {
+                  darkPages.push(i);
+                  if (info.dominantRgb) {
+                    bgSamples.push(info.dominantRgb);
+                  }
+                }
+              })
+              .catch(() => {})
+          );
+        }
+
+        await Promise.all(batch);
+        if (sessionId !== state.sessionId) return;
+
+        scanned = Math.min(total, start + BATCH_SIZE);
+        if (!state.userTouchedSelection || force) {
+          selectionSummary.textContent = `正在识别暗底页面 (${scanned}/${total})...`;
+        }
+      }
+
+      if (sessionId !== state.sessionId) return;
+
+      darkPages.sort((a, b) => a - b);
+      state.detectedDarkPages = darkPages;
+
+      // 取暗底页背景色的中位数，避免个别异常页拉偏
+      if (bgSamples.length > 0) {
+        const median = (arr) => {
+          const sorted = arr.slice().sort((a, b) => a - b);
+          return sorted[Math.floor(sorted.length / 2)];
+        };
+        state.detectedBgColor = {
+          r: median(bgSamples.map((c) => c.r)),
+          g: median(bgSamples.map((c) => c.g)),
+          b: median(bgSamples.map((c) => c.b)),
+        };
+      } else {
+        state.detectedBgColor = null;
+      }
+
+      applySmartAnalysisResult({ force });
+    } finally {
+      if (sessionId === state.sessionId) {
+        state.isAnalyzing = false;
+        smartSelectBtn.disabled = false;
+        updateSelectionUI();
+      }
+    }
+  }
+
+  function applySmartAnalysisResult({ force = false } = {}) {
+    const darkPages = state.detectedDarkPages || [];
+    const shouldApplySelection = force || !state.userTouchedSelection;
+    const shouldApplyWhiten = force || !state.userTouchedWhiten;
+
+    if (darkPages.length > 0) {
+      if (shouldApplySelection) {
+        state.selected = new Set(darkPages);
+        updateSelectionUI();
+      }
+
+      let whitened = false;
+      if (shouldApplyWhiten && state.detectedBgColor) {
+        whitened = applyDetectedBgColor(state.detectedBgColor);
+      }
+
+      if (shouldApplySelection) {
+        const hex = state.detectedBgColor
+          ? rgbToHex(
+              state.detectedBgColor.r / 255,
+              state.detectedBgColor.g / 255,
+              state.detectedBgColor.b / 255
+            )
+          : '';
+        const msg = whitened
+          ? `已自动选中 ${darkPages.length} / ${state.totalPages} 个暗底页面，并自动去灰底（${hex}）`
+          : `已自动选中 ${darkPages.length} / ${state.totalPages} 个暗底页面`;
+        showToast(msg, 'success', 3000);
+      }
+    } else if (shouldApplySelection) {
+      // 未检测到暗底页（例如纯白底文档转暗黑阅读），保留全选
+      state.selected.clear();
+      for (let i = 0; i < state.totalPages; i++) {
+        state.selected.add(i);
+      }
+      updateSelectionUI();
+      showToast('未检测到暗底页面，已默认全选', 'info', 2400);
+    }
   }
 
   async function handleAutoWhiten() {
@@ -449,77 +684,27 @@
 
     autoWhitenBtn.disabled = true;
     try {
-      const canvas = await sampleCanvasForPage(targetIndex);
+      const canvas = await sampleCanvasForPage(targetIndex, 240);
       if (!canvas) return;
 
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      const { width, height } = canvas;
-      const data = ctx.getImageData(0, 0, width, height).data;
-
-      // 步进采样像素，按 4 级量化统计深色区域（RGB <= 170）的主众数
-      const step = Math.max(1, Math.floor(Math.sqrt((width * height) / 8000)));
-      const buckets = new Map();
-      let totalSampled = 0;
-
-      for (let y = 2; y < height - 2; y += step) {
-        for (let x = 2; x < width - 2; x += step) {
-          totalSampled++;
-          const idx = (y * width + x) * 4;
-          const r = data[idx];
-          const g = data[idx + 1];
-          const b = data[idx + 2];
-
-          if (r <= 170 && g <= 170 && b <= 170) {
-            const kr = (r >> 2) << 2;
-            const kg = (g >> 2) << 2;
-            const kb = (b >> 2) << 2;
-            const key = (kr << 16) | (kg << 8) | kb;
-            let entry = buckets.get(key);
-            if (!entry) {
-              entry = { count: 0, sumR: 0, sumG: 0, sumB: 0 };
-              buckets.set(key, entry);
-            }
-            entry.count++;
-            entry.sumR += r;
-            entry.sumG += g;
-            entry.sumB += b;
-          }
-        }
-      }
-
-      let best = null;
-      for (const entry of buckets.values()) {
-        if (!best || entry.count > best.count) {
-          best = entry;
-        }
-      }
-
-      if (!best || best.count < totalSampled * 0.18) {
+      const { dominantRgb } = analyzeCanvasBackground(canvas);
+      if (!dominantRgb) {
         showToast('未检测到明显深色背景，可手动拖动滑块微调', 'info', 2600);
         return;
       }
 
-      const avgR = best.sumR / best.count;
-      const avgG = best.sumG / best.count;
-      const avgB = best.sumB / best.count;
-
-      if (Math.max(avgR, avgG, avgB) <= 6) {
-        resetEnhancement(false);
+      state.userTouchedWhiten = true;
+      const applied = applyDetectedBgColor(dominantRgb);
+      if (!applied) {
         showToast('当前背景已接近纯黑，无需额外去灰底', 'success', 2400);
         return;
       }
 
-      // 叠加约 2% 容差，消除压缩噪点导致的边缘残留灰斑
-      const margin = 5 / 255;
-      const r = Math.min(0.55, avgR / 255 + margin);
-      const g = Math.min(0.55, avgG / 255 + margin);
-      const b = Math.min(0.55, avgB / 255 + margin);
-
-      state.whiten = 0;
-      state.whitenColor = { r, g, b };
-      updateEnhancementUI();
-
-      const rawHex = rgbToHex(avgR / 255, avgG / 255, avgB / 255);
+      const rawHex = rgbToHex(
+        dominantRgb.r / 255,
+        dominantRgb.g / 255,
+        dominantRgb.b / 255
+      );
       showToast(`已识别背景色 ${rawHex}，已自动漂白为纯白底`, 'success', 2800);
     } catch (err) {
       console.error(err);
@@ -635,6 +820,7 @@
   thumbnailGrid.addEventListener('click', (e) => {
     const card = e.target.closest('.page-card');
     if (!card) return;
+    state.userTouchedSelection = true;
     handleCardToggle(Number(card.dataset.index), e.shiftKey);
   });
 
@@ -643,21 +829,29 @@
     const card = e.target.closest('.page-card');
     if (!card) return;
     e.preventDefault();
+    state.userTouchedSelection = true;
     handleCardToggle(Number(card.dataset.index), e.shiftKey);
   });
 
   // 快捷选页按钮
+  smartSelectBtn.addEventListener('click', () => {
+    autoAnalyzeDocument(state.sessionId, { force: true });
+  });
+
   selectAllBtn.addEventListener('click', () => {
+    state.userTouchedSelection = true;
     for (let i = 0; i < state.totalPages; i++) state.selected.add(i);
     updateSelectionUI();
   });
 
   selectNoneBtn.addEventListener('click', () => {
+    state.userTouchedSelection = true;
     state.selected.clear();
     updateSelectionUI();
   });
 
   invertSelectionBtn.addEventListener('click', () => {
+    state.userTouchedSelection = true;
     for (let i = 0; i < state.totalPages; i++) {
       if (state.selected.has(i)) {
         state.selected.delete(i);
@@ -669,12 +863,14 @@
   });
 
   selectOddBtn.addEventListener('click', () => {
+    state.userTouchedSelection = true;
     state.selected.clear();
     for (let i = 0; i < state.totalPages; i += 2) state.selected.add(i);
     updateSelectionUI();
   });
 
   selectEvenBtn.addEventListener('click', () => {
+    state.userTouchedSelection = true;
     state.selected.clear();
     for (let i = 1; i < state.totalPages; i += 2) state.selected.add(i);
     updateSelectionUI();
@@ -688,6 +884,7 @@
       showToast(error, 'error');
       return;
     }
+    state.userTouchedSelection = true;
     state.selected = pages;
     updateSelectionUI();
     showToast(`已选中 ${pages.size} 页`, 'info', 1800);
@@ -695,13 +892,17 @@
 
   // 增强模块事件绑定
   whitenSlider.addEventListener('input', () => {
+    state.userTouchedWhiten = true;
     state.whitenColor = null;
     state.whiten = Number(whitenSlider.value) / 100;
     updateEnhancementUI();
   });
 
   autoWhitenBtn.addEventListener('click', handleAutoWhiten);
-  resetWhitenBtn.addEventListener('click', () => resetEnhancement(true));
+  resetWhitenBtn.addEventListener('click', () => {
+    state.userTouchedWhiten = true;
+    resetEnhancement(true);
+  });
 
   exportBtn.addEventListener('click', handleExport);
 })();
