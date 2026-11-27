@@ -286,28 +286,15 @@ body {
 }
 
 .dropzone-title {
-  margin: 0 0 8px;
+  margin: 0 0 22px;
   font-size: 19px;
   font-weight: 600;
   color: var(--text-primary);
 }
 
-.dropzone-desc {
-  margin: 0 0 24px;
-  font-size: 13.5px;
-  color: var(--text-secondary);
-  max-width: 400px;
-}
-
 .dropzone-btn {
   padding: 10px 22px;
   font-size: 14px;
-}
-
-.privacy-note {
-  margin: 22px 0 0;
-  font-size: 12px;
-  color: var(--text-muted);
 }
 
 /* ===== 工作区吸顶工具栏 ===== */
